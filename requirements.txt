@@ -1,0 +1,15 @@
+numpy>=1.24
+scipy>=1.10
+soundfile>=0.12
+requests>=2.31
+yt-dlp>=2024.1.0
+
+# diarization + separation
+torch>=2.7
+torchaudio>=2.7
+pyannote.audio>=3.4,<4
+diffusers>=0.35
+huggingface_hub>=0.30
+silero-vad>=5.0
+
+# system requirement: ffmpeg and ffprobe on PATH
