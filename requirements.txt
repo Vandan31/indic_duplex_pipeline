@@ -1,0 +1,23 @@
+numpy>=1.24
+scipy>=1.10
+soundfile>=0.12
+requests>=2.31
+yt-dlp>=2024.1.0
+
+# diarization + separation
+torch>=2.7
+torchaudio>=2.7
+pyannote.audio>=3.4,<4
+diffusers>=0.35
+huggingface_hub>=0.30
+silero-vad>=5.0
+
+# transcription (word-level timestamps)
+# faster-whisper (CTranslate2) — a raw transformers ASR pipeline was tried
+# first but leaks GPU memory across a long file's word-timestamp extraction
+# (confirmed via repeated OOM at ~31GB on a 3-minute clip); faster-whisper's
+# runtime doesn't have that problem and is the standard tool for this.
+faster-whisper>=1.0
+transformers>=4.40  # only used by ct2-transformers-converter for the one-time model conversion
+
+# system requirement: ffmpeg and ffprobe on PATH
