@@ -70,8 +70,8 @@ corpus/accepted/<video_id>/
 ## Install
 
 ```bash
-git clone https://github.com/USERNAME/indic-duplex-pipeline.git
-cd indic-duplex-pipeline
+git clone https://github.com/Vandan31/indic_duplex_pipeline.git
+cd indic_duplex_pipeline
 pip install -r requirements.txt
 # ffmpeg and ffprobe must be on PATH
 
@@ -79,9 +79,16 @@ cp .env.example .env      # fill in your keys
 export $(grep -v '^#' .env | xargs)
 ```
 
-`NVIDIA_API_KEY` from [build.nvidia.com](https://build.nvidia.com) (free tier).
+`NVIDIA_API_KEY` from [build.nvidia.com](https://build.nvidia.com) (free tier),
+only needed for `discover`/`run` (the verification stage).
 `HF_TOKEN` needs the gated `pyannote/speaker-diarization-3.1`,
-`pyannote/segmentation-3.0` and `sarulab-speech/DialogueSidon` repos accepted.
+`pyannote/segmentation-3.0` and `sarulab-speech/DialogueSidon` repos accepted
+for `discover`/`run`, and separately the gated
+[`bodhan-ai/indic-transcribe-core`](https://huggingface.co/bodhan-ai/indic-transcribe-core)
+repo accepted for `transcribe` — request access on its HF page with the same
+account this token belongs to; approval is usually quick but isn't instant.
+**If you only need `transcribe` (see below), that's the only gated repo you
+need approved — you don't need the pyannote/DialogueSidon ones.**
 
 DialogueSidon inference needs the authors' script, which is not redistributed
 here — get it from
@@ -102,6 +109,103 @@ python duplex_corpus.py run --urls urls.txt --root ./corpus
 python duplex_corpus.py stats --root ./corpus    # funnel by rejection reason
 python duplex_corpus.py check --root ./corpus    # validate separated output
 ```
+
+## Transcription (word-level timestamps)
+
+A separate pass, independent of `run` — it only needs `corpus/accepted/`
+to already exist (from your own run of this pipeline, or any dataset already
+laid out in the same shape; see below).
+
+### Quickstart: annotating data you already scraped
+
+If you already have accepted clips (from this pipeline or your own scraping
+run) and just need to run transcription/annotation on them:
+
+```bash
+git clone https://github.com/Vandan31/indic_duplex_pipeline.git
+cd indic_duplex_pipeline
+pip install -r requirements.txt        # ffmpeg/ffprobe must be on PATH
+cp .env.example .env                   # fill in HF_TOKEN -- the only key
+                                        # this stage needs
+```
+
+Request access to the gated
+[`bodhan-ai/indic-transcribe-core`](https://huggingface.co/bodhan-ai/indic-transcribe-core)
+model on your HF account (same account as `HF_TOKEN`) *before* your first
+run — approval isn't instant, so do this first. You do **not** need the
+pyannote/DialogueSidon gated repos for transcription alone.
+
+Then point `--root` at wherever your data lives — it just needs to match the
+layout below (rename/symlink if it doesn't already):
+
+```bash
+python duplex_corpus.py transcribe --root /path/to/your/corpus --gpus 0,1,2,3
+```
+
+That's it. It's resumable (safe to Ctrl-C and rerun — skips clips that
+already have `transcript.json`, pass `--overwrite` to redo) and scales
+linearly with however many GPUs you list in `--gpus`, so for 4,000h you'll
+want as many as you can get. One worker thread per GPU; each accepted video
+is transcribed independently.
+
+**Expected input layout**, per `accepted/<id>/`:
+
+```
+accepted/<id>/
+  spk0.wav, spk1.wav   per-speaker channels (required)
+  meta.json            must have "language_code" (e.g. "hi") and, optionally,
+                        "speaker_map" (defaults to {"spk0":"SPEAKER_00",
+                        "spk1":"SPEAKER_01"})
+  segments.jsonl        optional — used to group words into turns; without it
+                        you still get transcript.json's flat word list, just
+                        no turns[]
+```
+
+If your existing data doesn't have this exact layout, the only hard
+requirements are the two speaker-channel wavs and `meta.json`'s
+`language_code` — adapt your directory structure (or add a thin wrapper
+script) to match rather than reworking the pipeline.
+
+**Pipeline:** ASR is
+[`bodhan-ai/indic-transcribe-core`](https://huggingface.co/bodhan-ai/indic-transcribe-core)
+(single model, native output across 27 Indic languages — no per-language
+model selection needed). Word-level timestamps come from CTC forced alignment
+(real [`uroman`](https://pypi.org/project/uroman/) romanization feeding the
+`ctc-forced-aligner` package's ONNX aligner — *not* that package's own
+`romanize=True` option, which silently uses `unidecode` instead of real
+uroman for Devanagari and produces wrong alignments).
+
+The alignment step has been observed to crash natively (SIGABRT/SIGSEGV
+inside onnxruntime, under memory pressure on long/complex clips) — it runs in
+an isolated subprocess so that only costs one clip's timestamps, never the
+whole `transcribe` run. If it crashes or times out for a clip, that one clip
+automatically falls back to `faster-whisper` (real word timestamps, just
+inheriting that model's known decoder-loop/timestamp-collapse quirks — this
+was the pipeline's previous default, kept only as this rare-path fallback
+now) and, if even that fails, to evenly-spaced estimated timestamps flagged
+with `"approx_timestamps": true` per word so they're easy to filter out
+downstream. Validated against the old all-Whisper pipeline on a 200-clip
+random sample (2026-09-24): ~1% mean 4-gram repetition rate vs ~7% for
+Whisper, and no stuck/duplicate word timestamps vs ~78% of Whisper clips
+affected — see the git history for the full comparison writeup if useful.
+
+Output, written to `accepted/<id>/transcript.json`:
+
+```json
+{
+  "id": "...",
+  "language_code": "hi",
+  "models": {"spk0": "bodhan-ai/indic-transcribe-core", "spk1": "..."},
+  "words": [{"speaker": "SPEAKER_00", "word": "...", "start": 1.23, "end": 1.45}, ...],
+  "turns": [{"speaker": "SPEAKER_00", "start": 1.2, "end": 4.5, "text": "..."}, ...]
+}
+```
+
+`models` records which pipeline actually produced each speaker's words —
+`bodhan-ai/indic-transcribe-core` for the normal path, a `vasista22/whisper-*`
+or `openai/whisper-large-v3` id if that clip hit the Whisper fallback. Check
+this field (or the per-word `approx_timestamps` flag) if you need to exclude
+fallback clips from anything timestamp-sensitive.
 
 Resumable — rerun the same command after an interruption and it continues.
 `stats` breaks rejections down by reason, which is how you tune thresholds: if

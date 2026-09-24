@@ -3,8 +3,10 @@ import base64
 import contextlib
 import functools
 import json
+import multiprocessing as mp
 import os
 import queue
+import random
 import re
 import shutil
 import sqlite3
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -81,20 +84,14 @@ INDIC = {
     "raj": "Rajasthani",  "mag": "Magahi",    "tcy": "Tulu",
 }
 
-# Per-language ASR model for word-level-timestamped transcription (stage 8).
-# vasista22's fine-tunes only for hi/ta/te are used here — verified live against
-# the HF API on 2026-08-24: those are the only ones at the large-v2 tier from
-# that author (gu/kn only go up to 'medium' there, and bn/mr/ml have none at
-# all). Rather than depend on a graveyard of low-download single-author
-# fine-tunes for the rest, every other language falls back to the actively
-# maintained openai/whisper-large-v3 (Apache-2.0, real multilingual coverage).
-# Swap a language's entry here if you find/trust a better dedicated fine-tune.
-ASR_LANG_MODEL = {
-    "hi": "vasista22/whisper-hindi-large-v2",
-    "ta": "vasista22/whisper-tamil-large-v2",
-    "te": "vasista22/whisper-telugu-large-v2",
-}
-ASR_DEFAULT_MODEL = "openai/whisper-large-v3"
+# ASR model for word-level-timestamped transcription (stage 8). Replaced the
+# per-language faster-whisper fine-tunes with a single model covering all 27
+# Indic languages natively -- validated against the old pipeline on a 200-clip
+# stratified random sample (2026-09-24): near-zero decoder-loop repetition
+# (1.2% vs 6.8% mean 4-gram repetition rate) and zero stuck/duplicate word
+# timestamps (vs 78% of old-pipeline clips affected), at the cost of forced
+# alignment (below) being a separate, isolated step.
+ASR_MODEL_ID = "bodhan-ai/indic-transcribe-core"
 
 
 @dataclass
@@ -105,12 +102,14 @@ class Thresholds:
     max_speech_ratio: float = 0.98     # above this is often a continuous monologue read
     min_turns: int = 20                # speaker changes across the file
     min_turns_per_min: float = 3.0
-    max_speaker_imbalance: float = 0.80  # dominant speaker's share of speech time
+    max_speaker_imbalance: float = 0.75  # dominant speaker's share of speech time
     min_overlap_ratio: float = 0.005   # some overlap = real conversation, not stitched VO
     max_overlap_ratio: float = 0.35    # too much = crosstalk mess or bad diarization
     min_segment_dur: float = 0.30      # drop diarization crumbs
-    verify_windows: int = 3            # how many clips to send to Nemotron
+    verify_windows: int = 5            # how many clips to send to Nemotron
     verify_window_sec: int = 45
+    min_lang_agreement: float = 0.6    # winning (code, name) pair's vote share required
+    min_lang_votes: int = 2            # fewer surviving window votes than this -> verify_failed
 
 TH = Thresholds()
 
@@ -119,6 +118,7 @@ REJECT_REASONS = [
     "low_speech", "high_speech", "verify_failed", "not_two_speakers",
     "not_indic", "not_conversational", "diarize_failed", "diar_speaker_count",
     "few_turns", "imbalanced", "overlap_out_of_range", "separate_failed", "emit_failed",
+    "no_qualifying_2spk_segment",
 ]
 
 
@@ -419,18 +419,53 @@ def slice_windows(wav: Path, duration: float, workdir: Path, n: int, win: int):
     return outs
 
 
-def verify(wav: Path, duration: float, api_key: str, sem: threading.Semaphore = None):
+def aggregate_language_votes(votes, min_agreement):
+    """Joint (language_code, language) vote across verify()'s window results.
+
+    language and language_code used to be voted on INDEPENDENTLY, which let a
+    split window vote produce a code/name pair that disagree with each other
+    (e.g. code="te", name="Hindi") -- is_hindi()'s OR check then only needed
+    one of the two fields to say Hindi to pass, regardless of what the other
+    field's own votes actually said. Voting on the pair jointly, as one unit,
+    closes that: the two fields can no longer diverge, and a genuine split
+    vote below min_agreement produces an explicit "uncertain" ("", "", ratio)
+    result instead of silently picking a winner.
+
+    `votes` is a list of per-window dicts (each with `language`/`language_code`
+    keys, as returned by nemo_verify_window). Returns (language_code,
+    language, agreement_ratio)."""
+    def norm_lang(v):
+        code = (v.get("language_code") or "").strip().lower().split("-")[0]
+        name = (v.get("language") or "").strip().lower()
+        return (code, name)
+
+    lang_pairs = [norm_lang(v) for v in votes]
+    if not lang_pairs:
+        return "", "", 0.0
+    (lang_code, lang_name), lang_win_count = Counter(lang_pairs).most_common(1)[0]
+    lang_agreement = lang_win_count / len(lang_pairs)
+    if lang_agreement < min_agreement:
+        return "", "", lang_agreement  # uncertain -- fails is_hindi() downstream like any other reject
+    return lang_code, lang_name, lang_agreement
+
+
+def verify(wav: Path, duration: float, api_keys, sem: threading.Semaphore = None):
     """Vote across several windows so one bad excerpt doesn't decide the file.
 
     `sem`, if given, caps how many Nemotron calls are in flight at once across
     ALL concurrent light-stage workers combined — the free-tier NIM endpoint
     is shared, so this is the point to throttle total concurrency, not just
-    per-video concurrency."""
+    per-video concurrency.
+
+    `api_keys` is a list — each window call picks one at random, spreading
+    load across multiple NIM accounts so no single key's rate limit becomes
+    the bottleneck."""
     with tempfile.TemporaryDirectory() as td:
         wins = slice_windows(wav, duration, Path(td), TH.verify_windows, TH.verify_window_sec)
         votes = []
         for w in wins:
             try:
+                api_key = random.choice(api_keys)
                 if sem is not None:
                     with sem:
                         v = nemo_verify_window(w, api_key)
@@ -442,7 +477,10 @@ def verify(wav: Path, duration: float, api_key: str, sem: threading.Semaphore = 
                 log(f"  verify window failed: {e}", "WARN")
             time.sleep(1)
 
-    if not votes:
+    # Fewer than this many windows actually returned a usable judgment (calls
+    # can silently drop -- see the `except` above) -- a lone surviving vote,
+    # or none, isn't enough to decide anything on, least of all language.
+    if len(votes) < TH.min_lang_votes:
         return None
 
     def majority(key, default=None):
@@ -451,12 +489,15 @@ def verify(wav: Path, duration: float, api_key: str, sem: threading.Semaphore = 
             return default
         return max(set(map(str, vals)), key=lambda x: list(map(str, vals)).count(x))
 
+    lang_code, lang_name, lang_agreement = aggregate_language_votes(votes, TH.min_lang_agreement)
+
     speaker_counts = [v.get("num_speakers") for v in votes if isinstance(v.get("num_speakers"), int)]
     return {
         "num_speakers": int(np.median(speaker_counts)) if speaker_counts else 0,
         "speaker_votes": speaker_counts,
-        "language": majority("language", ""),
-        "language_code": (majority("language_code", "") or "").lower(),
+        "language": lang_name,
+        "language_code": lang_code,
+        "language_agreement": round(lang_agreement, 2),
         "is_conversational": majority("is_conversational") == "True",
         "has_turn_taking": majority("has_turn_taking") == "True",
         "is_dubbed_or_voiceover": majority("is_dubbed_or_voiceover") == "True",
@@ -474,6 +515,22 @@ def is_indic(code: str, name: str) -> bool:
         return True
     name = (name or "").strip().lower()
     return any(name == v.lower() for v in INDIC.values())
+
+
+def is_hindi(code: str, name: str) -> bool:
+    """Strict Hindi-only gate — is_indic() is intentionally broad (this
+    pipeline can target any Indic language), but the current scraping goal
+    is Hindi-only, and the broad gate was letting ~36% non-Hindi Indic
+    content (Telugu, Tamil, Marathi, ...) into the accepted set.
+
+    code and name now come from verify()'s single joint (code, name) vote
+    (see norm_lang there), so they can no longer disagree with each other --
+    `name` is checked only as a fallback for a missing/unrecognized code, not
+    as an independent second vote that could pass on its own."""
+    code = (code or "").lower().split("-")[0]
+    if code:
+        return code == "hi"
+    return (name or "").strip().lower() == "hindi"
 
 
 # ----------------------------------------------------------------------------
@@ -505,7 +562,29 @@ def _allow_trusted_checkpoint_unpickling():
         torch.load = original_load
 
 
+def _patch_hf_hub_use_auth_token():
+    """pyannote.audio (core/pipeline.py, core/model.py) still calls
+    huggingface_hub.hf_hub_download(..., use_auth_token=...) — removed from
+    hf_hub_download's signature in huggingface_hub>=1.0 (renamed to `token`).
+    Shim it here rather than pinning huggingface_hub down, since diffusers/
+    transformers in this env require huggingface_hub>=1.0 themselves."""
+    import huggingface_hub
+    if getattr(huggingface_hub.hf_hub_download, "_use_auth_token_shim", False):
+        return
+    _orig = huggingface_hub.hf_hub_download
+
+    @functools.wraps(_orig)
+    def _shimmed(*args, **kwargs):
+        if "use_auth_token" in kwargs:
+            kwargs.setdefault("token", kwargs.pop("use_auth_token"))
+        return _orig(*args, **kwargs)
+
+    _shimmed._use_auth_token_shim = True
+    huggingface_hub.hf_hub_download = _shimmed
+
+
 def _load_pyannote(device_str: str):
+    _patch_hf_hub_use_auth_token()
     from pyannote.audio import Pipeline
     import torch
     token = HF_TOKEN or os.environ.get("HF_TOKEN")
@@ -534,9 +613,16 @@ def _load_pyannote(device_str: str):
 def diarize_pyannote(wav: Path, num_speakers=2, device: str = "cuda"):
     """`device` keys the model cache — each GPU worker thread gets its own
     pipeline instance so concurrent heavy workers never share one Pipeline
-    object (and never silently reuse another device's loaded weights)."""
+    object (and never silently reuse another device's loaded weights).
+
+    `num_speakers=None` runs pyannote's own auto speaker-count estimation
+    instead of forcing a count — used when we want the true speaker
+    inventory (e.g. to mine 2-speaker segments out of a 3+-speaker file)
+    rather than a diarization that's already been coerced to match a
+    hypothesis."""
     pipe = _get_or_load(_diar_cache, ("pyannote", device), lambda: _load_pyannote(device))
-    ann = pipe(str(wav), num_speakers=num_speakers)
+    kwargs = {} if num_speakers is None else {"num_speakers": num_speakers}
+    ann = pipe(str(wav), **kwargs)
     segs = [{"start": float(t.start), "end": float(t.end), "speaker": str(spk)}
             for t, _, spk in ann.itertracks(yield_label=True)]
     return sorted(segs, key=lambda s: s["start"])
@@ -569,6 +655,98 @@ def diarize(wav: Path, backend: str, num_speakers=2, device: str = "cuda"):
     fn = diarize_nemo if backend == "nemo" else diarize_pyannote
     segs = fn(wav, num_speakers, device=device)
     return [s for s in segs if s["end"] - s["start"] >= TH.min_segment_dur]
+
+
+def _split_by_silence(segs, gap_seconds):
+    """Group consecutive diarization segments; split wherever the gap
+    between turns is >= gap_seconds (topic changes, ad breaks, etc. tend to
+    land on a real pause, so this is a natural place to cut before even
+    looking at speaker count)."""
+    if not segs:
+        return []
+    groups = [[segs[0]]]
+    for seg in segs[1:]:
+        if seg["start"] - groups[-1][-1]["end"] >= gap_seconds:
+            groups.append([seg])
+        else:
+            groups[-1].append(seg)
+    return groups
+
+
+def _two_speaker_runs(segs):
+    """Within one silence-delimited group, find all maximal contiguous
+    sub-sequences of turns involving exactly 2 distinct speakers. A 3rd
+    speaker's segment closes the current run and starts a fresh one — this
+    walks real segment boundaries directly (no grid/window sampling, no
+    boundary snapping), so there's no way for a 3rd speaker's audio to leak
+    into a run by construction."""
+    if not segs:
+        return []
+    runs = []
+    current = [segs[0]]
+    speakers = {segs[0]["speaker"]}
+    for seg in segs[1:]:
+        if seg["speaker"] in speakers or len(speakers) < 2:
+            current.append(seg)
+            speakers.add(seg["speaker"])
+        else:
+            if len(speakers) == 2:
+                runs.append(current)
+            current = [seg]
+            speakers = {seg["speaker"]}
+    if len(speakers) == 2:
+        runs.append(current)
+    return runs
+
+
+def _split_long_run(segs, max_dur, min_dur):
+    """Cap an individual dialogue run at max_dur seconds so one very long
+    clean 2-speaker stretch becomes several bounded clips instead of one
+    giant one; drop a trailing remainder shorter than min_dur."""
+    start0 = segs[0]["start"]
+    if segs[-1]["end"] - start0 <= max_dur:
+        return [segs]
+    chunks, current, chunk_start = [], [], start0
+    for seg in segs:
+        current.append(seg)
+        if seg["end"] - chunk_start >= max_dur:
+            chunks.append(current)
+            current, chunk_start = [], seg["end"]
+    if current and current[-1]["end"] - chunk_start >= min_dur:
+        chunks.append(current)
+    return chunks
+
+
+def mine_two_speaker_windows(segs, min_chunk_dur, max_chunk_dur=600.0, gap_seconds=5.0):
+    """Given a full (possibly 3+-speaker) diarization timeline, return the
+    contiguous (start, end, speaker_pair) windows where exactly 2 distinct
+    speakers are active — e.g. the core interview in a file whose intro is
+    a solo-host monologue and whose middle has a brief 3rd-guest cameo.
+
+    Splits on silence gaps first, then extracts maximal 2-speaker turn
+    sequences within each piece, then caps any run longer than
+    `max_chunk_dur`. Windows shorter than `min_chunk_dur` are dropped.
+    A genuinely 2-speaker file collapses to ~one run spanning the whole
+    file, same as before."""
+    if not segs:
+        return []
+    windows = []
+    for group in _split_by_silence(segs, gap_seconds):
+        for run in _two_speaker_runs(group):
+            if run[-1]["end"] - run[0]["start"] < min_chunk_dur:
+                continue
+            for chunk in _split_long_run(run, max_chunk_dur, min_chunk_dur):
+                t0, t1 = chunk[0]["start"], chunk[-1]["end"]
+                if t1 - t0 >= min_chunk_dur:
+                    windows.append((t0, t1, frozenset(s["speaker"] for s in chunk)))
+    return windows
+
+
+def slice_wav(src: Path, t0: float, t1: float, dest: Path):
+    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-i", str(src), "-ss", f"{max(0.0, t0):.3f}", "-to", f"{t1:.3f}",
+         "-ar", str(SR), "-ac", "1", str(dest)])
+    return dest
 
 
 # ----------------------------------------------------------------------------
@@ -808,6 +986,18 @@ def mark_overlaps(segs):
 
 def emit(vid, wav: Path, segs, stats, meta, verdict, root: Path,
          channels=None, chan_sr=None, separator="sidon"):
+    # Defense in depth: the language gate normally runs upstream (is_hindi()
+    # in stage_light, before diarization/separation ever run), but this is
+    # the single choke point every accept path funnels through before a
+    # manifest row exists -- refuse here too, so a future out-of-band caller
+    # (a backfill script, a --redo, a different driver) can't silently
+    # repeat the language-contamination bug even if it forgets the upstream
+    # check. Caller (_emit_chunk) already treats emit() exceptions as a
+    # reject, so this needs no new handling there.
+    if not is_hindi(verdict.get("language_code"), verdict.get("language")):
+        raise ValueError(f"emit() refused non-Hindi verdict: "
+                          f"code={verdict.get('language_code')!r} name={verdict.get('language')!r}")
+
     outdir = root / "accepted" / vid
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -874,20 +1064,90 @@ def reject(store, vid, url, reason, stage, meta=None, raw: Path = None, keep_raw
         raw.unlink(missing_ok=True)
 
 
+_ytdlp_backoff_lock = threading.Lock()
+_ytdlp_backoff_until = [0.0]
+_ytdlp_backoff_streak = [0]          # consecutive triggers with no clean gap between
+_ytdlp_backoff_base_secs = 300        # 5min, doubles per streak, capped below
+_ytdlp_backoff_max_secs = 2400        # 40min cap
+
+_ytdlp_botwall_streak = [0]           # separate, longer escalation for the
+_ytdlp_botwall_base_secs = 900        # harder "sign in to confirm you're not
+_ytdlp_botwall_max_secs = 5400        # a bot" wall, which is IP/session-level
+                                       # flagging and doesn't clear on the
+                                       # same short timescale as the sliding
+                                       # window rate limit.
+
+
+def _note_ytdlp_error(detail: str):
+    """YouTube's rate limit is a short sliding window in practice (clears
+    within ~1-2 min of quiet), not the 'up to an hour' the error claims —
+    but hundreds of threads plowing through it anyway just re-triggers it
+    and wastes the whole candidate list. On the first sign of it, make
+    every worker pause instead of continuing to hammer. Backoff duration
+    escalates (5/10/20/40min) if it keeps re-triggering right as workers
+    wake up, and resets once a pause has actually gone by without a hit.
+
+    A harder "sign in to confirm you're not a bot" wall (IP/session-level
+    flagging, not a sliding window) gets its own longer escalation
+    (15/30/60/90min) since it doesn't self-clear on the same timescale."""
+    low = detail.lower()
+    is_rate_limit = "rate-limit" in low or "rate limited" in low
+    is_bot_wall = "sign in to confirm" in low and "bot" in low
+    if not is_rate_limit and not is_bot_wall:
+        return
+    with _ytdlp_backoff_lock:
+        now = time.time()
+        # A hit that lands well after the previous backoff should have
+        # expired means the streak actually broke clean in between —
+        # treat this as a fresh streak rather than continuing to escalate.
+        if now > _ytdlp_backoff_until[0] + 60:
+            _ytdlp_backoff_streak[0] = 0
+            _ytdlp_botwall_streak[0] = 0
+        if is_bot_wall:
+            _ytdlp_botwall_streak[0] += 1
+            secs = min(_ytdlp_botwall_base_secs * (2 ** (_ytdlp_botwall_streak[0] - 1)),
+                       _ytdlp_botwall_max_secs)
+            log(f"  YouTube bot-check wall detected — pausing all light-stage "
+                f"workers for {secs // 60}min (streak {_ytdlp_botwall_streak[0]})", "WARN")
+        else:
+            _ytdlp_backoff_streak[0] += 1
+            secs = min(_ytdlp_backoff_base_secs * (2 ** (_ytdlp_backoff_streak[0] - 1)),
+                       _ytdlp_backoff_max_secs)
+            log(f"  YouTube rate-limit detected — pausing all light-stage workers "
+                f"for {secs // 60}min (streak {_ytdlp_backoff_streak[0]})", "WARN")
+        _ytdlp_backoff_until[0] = now + secs
+
+
+def _wait_out_ytdlp_backoff():
+    remaining = _ytdlp_backoff_until[0] - time.time()
+    if remaining > 0:
+        # Stagger the wake-up across workers instead of everyone resuming
+        # in the same instant, which would just re-trigger the limit again.
+        time.sleep(remaining + random.uniform(0, 25))
+
+
 def stage_light(url, root: Path, store: Store, args, verify_sem: threading.Semaphore = None):
     """probe -> download -> VAD prefilter -> Nemotron verify. Network/API-bound,
     safe to run with high thread concurrency. Returns a payload dict for the
     heavy (GPU) stage on pass, or None if rejected (or already decided)."""
+    # Sustained scraping (hours, many threads) trips YouTube's rate limiter
+    # even with modest --workers — pace every yt-dlp-touching call with a
+    # jittered delay so the aggregate request rate stays polite regardless
+    # of thread count.
+    time.sleep(random.uniform(6.0, 14.0))
+    _wait_out_ytdlp_backoff()
     auth_args = ytdlp_auth_args(args)
     try:
         meta = probe(url, auth_args)
     except subprocess.CalledProcessError as e:
         detail = (e.stderr or e.stdout or str(e)).strip().splitlines()[-1:] or [str(e)]
         log(f"  probe failed: {detail[0][:300]}", "WARN")
+        _note_ytdlp_error(detail[0] if detail else "")
         store.set(url, url, "rejected", "probe_failed", "probe")
         return None
     except Exception as e:
         log(f"  probe failed: {str(e)[:200]}", "WARN")
+        _note_ytdlp_error(str(e))
         store.set(url, url, "rejected", "probe_failed", "probe")
         return None
     vid = meta["id"]
@@ -919,10 +1179,12 @@ def stage_light(url, root: Path, store: Store, args, verify_sem: threading.Semap
         except subprocess.CalledProcessError as e:
             detail = (e.stderr or e.stdout or str(e)).strip().splitlines()[-1:] or [str(e)]
             log(f"  download failed: {detail[0][:300]}", "WARN")
+            _note_ytdlp_error(detail[0] if detail else "")
             reject(store, vid, url, "download_failed", "fetch", meta, raw, args.keep_raw)
             return None
         except Exception as e:
             log(f"  download failed: {str(e)[:300]}", "WARN")
+            _note_ytdlp_error(str(e))
             reject(store, vid, url, "download_failed", "fetch", meta, raw, args.keep_raw)
             return None
 
@@ -938,17 +1200,22 @@ def stage_light(url, root: Path, store: Store, args, verify_sem: threading.Semap
         return None
 
     log(f"  [{vid}] verifying with Nemotron ({TH.verify_windows} windows)")
-    v = verify(raw, dur, args.api_key, sem=verify_sem)
+    v = verify(raw, dur, args.api_keys, sem=verify_sem)
     if not v:
         reject(store, vid, url, "verify_failed", "verify", meta, raw, args.keep_raw)
         return None
     log(f"    [{vid}] speakers={v['num_speakers']} lang={v['language']} "
         f"conv={v['is_conversational']} conf={v['confidence']}")
 
-    if v["num_speakers"] != 2:
+    if v["num_speakers"] < 2:
+        # Whole-file gate only rules out confident monologues here — a file
+        # whose sampled windows suggest 3+ speakers still gets a real,
+        # unconstrained diarization in stage_heavy, which mines out any
+        # contiguous exactly-2-speaker stretches instead of discarding the
+        # whole file on a coarse whole-file vote.
         reject(store, vid, url, "not_two_speakers", "verify", {**meta, "verify": v}, raw, args.keep_raw)
         return None
-    if not is_indic(v["language_code"], v["language"]):
+    if not is_hindi(v["language_code"], v["language"]):
         reject(store, vid, url, "not_indic", "verify", {**meta, "verify": v}, raw, args.keep_raw)
         return None
     if not v["is_conversational"] or v["music_dominant"] or v["is_dubbed_or_voiceover"]:
@@ -958,17 +1225,52 @@ def stage_light(url, root: Path, store: Store, args, verify_sem: threading.Semap
     return {"vid": vid, "url": url, "meta": meta, "dur": dur, "raw": raw, "v": v}
 
 
+def _emit_chunk(seg_vid, chunk_wav, sub_segs, stats, meta, v, root, args, device, url, store):
+    """Shared tail of stage_heavy for one candidate window (the whole file,
+    or one mined 2-speaker chunk of it): separate -> emit -> record."""
+    channels, chan_sr = None, None
+    if args.separator == "sidon":
+        log(f"  [{seg_vid}] separating with DialogueSidon ({device})")
+        try:
+            channels, chan_sr = separate_sidon(chunk_wav, args.sidon_script, device, args.sidon_steps)
+        except Exception as e:
+            log(f"    {str(e)[:250]}", "WARN")
+            reject(store, seg_vid, url, "separate_failed", "separate", meta)
+            return False
+
+    try:
+        outdir = emit(seg_vid, chunk_wav, sub_segs, stats, meta, v, root,
+                      channels=channels, chan_sr=chan_sr,
+                      separator=args.separator if channels is not None else "mask")
+    except Exception as e:
+        log(f"    {str(e)[:200]}", "WARN")
+        reject(store, seg_vid, url, "emit_failed", "emit", meta)
+        return False
+
+    store.set(seg_vid, url, "accepted", "", "emit", {**meta, "verify": v, "stats": stats})
+    log(f"  ACCEPT [{seg_vid}] -> {outdir}")
+    return True
+
+
 def stage_heavy(payload, device: str, root: Path, store: Store, args):
     """diarize -> qualify -> (maybe) separate -> emit. GPU-bound; runs on a
-    thread pinned to one device (or CPU) for its whole life."""
+    thread pinned to one device (or CPU) for its whole life.
+
+    For the pyannote/nemo backends this diarizes WITHOUT forcing a 2-speaker
+    hypothesis. A file that's genuinely 2-speaker collapses to one window
+    covering ~the whole thing (unchanged from before). A file with a 3rd
+    speaker (a brief guest, an intro monologue before a co-host joins, ad
+    reads) gets mined for the contiguous stretches that ARE exactly 2
+    speakers — each qualifying stretch is emitted as its own accepted clip
+    (`{vid}_seg0`, `{vid}_seg1`, ...) instead of the whole file being thrown
+    away for not being 2-speaker end to end."""
     vid, url, meta = payload["vid"], payload["url"], payload["meta"]
     dur, raw, v = payload["dur"], payload["raw"], payload["v"]
-    channels, chan_sr = None, None
 
     if args.diarizer == "sidon-vad":
         # Separate first, then derive the timeline from each clean channel.
-        # No pyannote, no HF gate — but you pay diffusion cost before the
-        # turn-taking gate can reject the file.
+        # Sidon always yields a fixed 2-channel separation, so there's no
+        # "true speaker count" to mine here — unchanged from before.
         log(f"  [{vid}] separating with DialogueSidon ({device})")
         try:
             channels, chan_sr = separate_sidon(raw, args.sidon_script, device, args.sidon_steps)
@@ -976,47 +1278,80 @@ def stage_heavy(payload, device: str, root: Path, store: Store, args):
             log(f"    {str(e)[:250]}", "WARN")
             reject(store, vid, url, "separate_failed", "separate", meta, raw, args.keep_raw)
             return
-        segs = diarize_from_channels(channels, chan_sr)
+        segs_full = diarize_from_channels(channels, chan_sr)
+        windows = [(0.0, dur, None)]
     else:
-        # Cheap gate first: diarize the mixture, reject bad conversations before
-        # spending GPU minutes on diffusion.
         log(f"  [{vid}] diarizing ({args.diarizer}, {device})")
         try:
-            segs = diarize(raw, args.diarizer, num_speakers=2, device=device)
+            segs_full = diarize(raw, args.diarizer, num_speakers=None, device=device)
         except Exception as e:
             log(f"    {str(e)[:200]}", "WARN")
             reject(store, vid, url, "diarize_failed", "diarize", meta, raw, args.keep_raw)
             return
 
-    stats = conversation_stats(segs, dur)
-    log(f"    [{vid}] turns={stats.get('n_turns')} tpm={stats.get('turns_per_min')} "
-        f"dom={stats.get('dominance')} ovl={stats.get('overlap_ratio')}")
+        n_speakers_full = len({s["speaker"] for s in segs_full})
+        if n_speakers_full == 2:
+            windows = [(0.0, dur, None)]
+        elif n_speakers_full > 2:
+            windows = mine_two_speaker_windows(segs_full, min_chunk_dur=TH.min_duration)
+            log(f"    [{vid}] {n_speakers_full} true speakers detected -> "
+                f"{len(windows)} candidate 2-speaker window(s)")
+        else:
+            windows = []
 
-    bad = qualify(stats)
-    if bad:
-        reject(store, vid, url, bad, "qualify", {**meta, "verify": v, "stats": stats}, raw, args.keep_raw)
-        return
-
-    if channels is None and args.separator == "sidon":
-        log(f"  [{vid}] separating with DialogueSidon ({device})")
-        try:
-            channels, chan_sr = separate_sidon(raw, args.sidon_script, device, args.sidon_steps)
-        except Exception as e:
-            log(f"    {str(e)[:250]}", "WARN")
-            reject(store, vid, url, "separate_failed", "separate", meta, raw, args.keep_raw)
+        if not windows:
+            reject(store, vid, url, "diar_speaker_count", "diarize",
+                   {**meta, "verify": v, "n_speakers_true": n_speakers_full}, raw, args.keep_raw)
             return
 
-    try:
-        outdir = emit(vid, raw, segs, stats, meta, v, root,
-                      channels=channels, chan_sr=chan_sr,
-                      separator=args.separator if channels is not None else "mask")
-    except Exception as e:
-        log(f"    {str(e)[:200]}", "WARN")
-        reject(store, vid, url, "emit_failed", "emit", meta, raw, args.keep_raw)
-        return
+    single_whole_file = len(windows) == 1 and windows[0][0] == 0.0 and windows[0][1] == dur
+    n_accepted = 0
 
-    store.set(vid, url, "accepted", "", "emit", {**meta, "verify": v, "stats": stats})
-    log(f"  ACCEPT [{vid}] -> {outdir}")
+    for idx, (t0, t1, pair) in enumerate(windows):
+        seg_vid = vid if single_whole_file else f"{vid}_seg{idx}"
+        sub_dur = t1 - t0
+        # Snapping window edges to the nearest real segment boundary (in
+        # mine_two_speaker_windows) is boundary-agnostic — it can snap onto
+        # a 3rd speaker's segment edge that happens to sit closest to the
+        # cut point. Filtering to `pair`'s own speakers (not just the time
+        # range) guards against a stray 3rd-speaker sliver leaking into an
+        # otherwise-clean 2-speaker chunk regardless of snap precision.
+        if single_whole_file:
+            sub_segs = list(segs_full)
+        else:
+            sub_segs = [{**s, "start": max(0.0, s["start"] - t0), "end": min(t1, s["end"]) - t0}
+                        for s in segs_full
+                        if s["end"] > t0 and s["start"] < t1 and (pair is None or s["speaker"] in pair)]
+
+        stats = conversation_stats(sub_segs, sub_dur)
+        log(f"    [{seg_vid}] turns={stats.get('n_turns')} tpm={stats.get('turns_per_min')} "
+            f"dom={stats.get('dominance')} ovl={stats.get('overlap_ratio')}")
+
+        bad = qualify(stats)
+        if bad:
+            if single_whole_file:
+                reject(store, vid, url, bad, "qualify", {**meta, "verify": v, "stats": stats}, raw, args.keep_raw)
+                return
+            reject(store, seg_vid, url, bad, "qualify", {**meta, "verify": v, "stats": stats})
+            continue
+
+        seg_meta = meta if single_whole_file else {**meta, "duration": sub_dur, "segment_of": vid,
+                                                    "segment_start": t0, "segment_end": t1}
+        chunk_wav = raw if single_whole_file else slice_wav(raw, t0, t1, raw.parent / f"{seg_vid}.wav")
+        ok = _emit_chunk(seg_vid, chunk_wav, sub_segs, stats, seg_meta, v, root, args, device, url, store)
+        if chunk_wav is not raw:
+            chunk_wav.unlink(missing_ok=True)
+        if ok:
+            n_accepted += 1
+
+    if not single_whole_file:
+        # Record a status for the ORIGINAL id too, purely so a future rerun's
+        # stage_light SKIP check (which looks up the original vid) doesn't
+        # reprocess this episode from scratch every time.
+        if n_accepted:
+            store.set(vid, url, "accepted", f"{n_accepted}_segment(s)", "emit", {**meta, "verify": v})
+        else:
+            store.set(vid, url, "rejected", "no_qualifying_2spk_segment", "qualify", {**meta, "verify": v})
 
     if not args.keep_raw:
         raw.unlink(missing_ok=True)
@@ -1059,8 +1394,10 @@ def resolve_devices(gpus_arg: str):
 
 def cmd_run(args):
     need("yt-dlp"); need("ffmpeg"); need("ffprobe")
-    if not args.api_key:
-        sys.exit("ERROR: set NVIDIA_API_KEY at the top of this script or pass --api-key")
+    args.api_keys = [k.strip() for k in (args.api_key or "").split(",") if k.strip()]
+    if not args.api_keys:
+        sys.exit("ERROR: set NVIDIA_API_KEY at the top of this script or pass --api-key "
+                  "(comma-separate multiple keys to spread load across them)")
 
     if getattr(args, "min_duration", None):
         TH.min_duration = args.min_duration
@@ -1202,24 +1539,178 @@ def cmd_export(args):
 # stage 8 — transcription (word-level timestamps)
 # ----------------------------------------------------------------------------
 
-_asr_cache = {}
+_indic_asr_cache = {}
+_alignment_workers = {}
+_alignment_workers_lock = threading.Lock()
+
+# Very long / complex clips have been observed (200-clip validation run,
+# 2026-09-24) to crash the CTC forced-alignment step with a native SIGABRT/
+# SIGSEGV -- inside onnxruntime/torch, under memory pressure, before any
+# Python try/except can catch it. Earlier attempt used a fixed duration cutoff
+# to dodge this, but that would have silently dropped word-level timestamps
+# for ~314h (23%) of the corpus's long-tail clips. Isolating the alignment
+# call in a dedicated subprocess (below) removes the need to guess a safe
+# duration at all: every clip gets a real alignment attempt, and only the
+# ones that actually crash or hang fall back to approximate timestamps --
+# and only that one clip is affected, since the crash can't take down the
+# worker thread or any other in-flight clip.
+ALIGN_TIMEOUT_SEC = 1800  # 30 min wall-clock ceiling per clip's alignment call
+
+
+def _alignment_worker_main(device_str, req_q, res_q):
+    """Runs in an isolated child process. Loads the aligner once, then serves
+    align requests until killed. A native crash here only takes down this
+    process -- the parent (AlignmentWorker.align) detects it and respawns."""
+    # AlignmentSingleton's onnxruntime session has no device kwarg -- it
+    # picks up whichever GPU CUDA_VISIBLE_DEVICES exposes, so pin it here
+    # (before onnxruntime/ctc_forced_aligner import) to match the ASR
+    # model's device for this same worker slot, not always GPU 0.
+    if device_str.startswith("cuda"):
+        idx = device_str.split(":")[-1] if ":" in device_str else "0"
+        os.environ["CUDA_VISIBLE_DEVICES"] = idx
+    import uroman as uroman_lib
+    from ctc_forced_aligner import (
+        AlignmentSingleton, generate_emissions, get_alignments, get_spans,
+        postprocess_results, load_audio,
+    )
+    ur = uroman_lib.Uroman()
+    aligner = AlignmentSingleton()
+
+    def real_preprocess(text, language="hin"):
+        tokens_starred, text_starred = [], []
+        for w in (w for w in text.split() if w.strip()):
+            roman = re.sub(r"[^a-z]", "", ur.romanize_string(w, lcode=language).strip().lower())
+            if not roman:
+                continue
+            tokens_starred += ["<star>", " ".join(list(roman))]
+            text_starred += ["<star>", w]
+        return tokens_starred, text_starred
+
+    while True:
+        wav_path, text = req_q.get()
+        try:
+            audio_waveform = load_audio(wav_path, ret_type="np")
+            emissions, stride = generate_emissions(aligner.alignment_model, audio_waveform)
+            tokens_starred, text_starred = real_preprocess(text)
+            segments, scores, blank_label = get_alignments(
+                emissions, tokens_starred, aligner.alignment_tokenizer)
+            spans = get_spans(tokens_starred, segments, blank_label)
+            word_ts = postprocess_results(text_starred, spans, stride, scores)
+            res_q.put(("ok", [
+                {"word": w["text"], "start": round(float(w["start"]), 3), "end": round(float(w["end"]), 3)}
+                for w in word_ts
+            ]))
+        except Exception as e:
+            res_q.put(("error", f"{type(e).__name__}: {str(e)[:300]}"))
+
+
+class AlignmentWorker:
+    """One long-lived, isolated subprocess per device. Models are loaded once
+    (expensive) and reused across clips; a crash or hang on one clip respawns
+    the process for the next one instead of poisoning the caller."""
+
+    # 'spawn', not the Linux default 'fork': by the time this worker is
+    # created, the parent already has CUDA initialized (ASR/diarization
+    # models loaded) — forking a CUDA-initialized process is a well-known
+    # hang/crash source, since the child inherits a CUDA context it can't
+    # actually use. spawn re-imports cleanly instead.
+    _ctx = mp.get_context("spawn")
+
+    def __init__(self, device_str):
+        self.device_str = device_str
+        self.req_q = None
+        self.res_q = None
+        self.proc = None
+        self._lock = threading.Lock()
+        self._start()
+
+    def _start(self):
+        self.req_q = self._ctx.Queue()
+        self.res_q = self._ctx.Queue()
+        self.proc = self._ctx.Process(
+            target=_alignment_worker_main,
+            args=(self.device_str, self.req_q, self.res_q),
+            daemon=True,
+        )
+        self.proc.start()
+
+    def align(self, wav_path: str, text: str):
+        """Returns (words_or_None, error_or_None). Serialized per worker --
+        the subprocess handles one clip at a time by design (matches how the
+        old code used one model instance per device)."""
+        with self._lock:
+            if not self.proc.is_alive():
+                self._start()
+            self.req_q.put((wav_path, text))
+            deadline = time.time() + ALIGN_TIMEOUT_SEC
+            while time.time() < deadline:
+                if not self.proc.is_alive():
+                    self._start()
+                    return None, "WORKER_CRASHED (native abort/segfault)"
+                try:
+                    status, payload = self.res_q.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                if status == "ok":
+                    return payload, None
+                return None, payload
+            self.proc.terminate()
+            self.proc.join(timeout=5)
+            self._start()
+            return None, f"TIMEOUT (>{ALIGN_TIMEOUT_SEC}s)"
+
+
+def get_alignment_worker(device_str: str) -> AlignmentWorker:
+    with _alignment_workers_lock:
+        if device_str not in _alignment_workers:
+            _alignment_workers[device_str] = AlignmentWorker(device_str)
+        return _alignment_workers[device_str]
+
+
+def _load_indic_asr(device_str: str):
+    from huggingface_hub import snapshot_download
+    log(f"  loading ASR model {ASR_MODEL_ID} on {device_str} (first call for this key)")
+    t0 = time.time()
+    model_dir = snapshot_download(ASR_MODEL_ID)
+    if model_dir not in sys.path:
+        sys.path.insert(0, model_dir)
+    from indic_transcribe import IndicTranscribe
+    model = IndicTranscribe.from_pretrained(model_dir, device=device_str)
+    log(f"  ASR model {ASR_MODEL_ID} ready on {device_str} in {time.time() - t0:.0f}s")
+    return model
+
+
+def get_asr_pipeline(device_str: str):
+    """Cached per device — same lazy-singleton pattern as the diarization/
+    separation model caches, so concurrent GPU workers each get their own
+    model instance without racing on first load."""
+    return _get_or_load(_indic_asr_cache, device_str, lambda: _load_indic_asr(device_str))
+
+
+# ---- legacy Whisper fallback -----------------------------------------------
+# Only used for the small minority of clips (~2.5% in the 200-clip validation
+# run, 2026-09-24) whose new-pipeline forced alignment crashes/times out even
+# with subprocess isolation. Gives real word-level timestamps for that one
+# clip instead of linear interpolation -- inherits the old pipeline's known
+# failure modes (decoder-loop repetition, stuck timestamps) but only for this
+# rare fallback path, not the default one.
+_whisper_cache = {}
 CT2_MODEL_DIR = Path(__file__).resolve().parent / ".ct2_models"
+WHISPER_LANG_MODEL = {
+    "hi": "vasista22/whisper-hindi-large-v2",
+    "ta": "vasista22/whisper-tamil-large-v2",
+    "te": "vasista22/whisper-telugu-large-v2",
+}
+WHISPER_DEFAULT_MODEL = "openai/whisper-large-v3"
 
 
 def _ct2_model_path(model_id: str) -> str:
-    """faster-whisper (CTranslate2) needs CT2-format weights. Official OpenAI
-    releases resolve via faster-whisper's own built-in size aliases (backed
-    by Systran's pre-converted HF repos) — no conversion needed. Third-party
-    fine-tunes like vasista22's are plain HF/PyTorch format and need a
-    one-time conversion, cached on disk so it only happens once per model."""
     if model_id == "openai/whisper-large-v3":
         return "large-v3"
     out_dir = CT2_MODEL_DIR / model_id.replace("/", "__")
     if not (out_dir / "model.bin").exists():
         log(f"  converting {model_id} to CTranslate2 format (one-time, cached at {out_dir})")
         out_dir.mkdir(parents=True, exist_ok=True)
-        # Resolve next to the running interpreter, not via PATH — this gets
-        # invoked from worker threads that may not have the venv "activated".
         converter = Path(sys.executable).parent / "ct2-transformers-converter"
         run([str(converter) if converter.exists() else "ct2-transformers-converter",
              "--model", model_id,
@@ -1227,51 +1718,72 @@ def _ct2_model_path(model_id: str) -> str:
     return str(out_dir)
 
 
-def _load_asr_pipeline(model_id: str, device_str: str):
+def _load_whisper_pipeline(model_id: str, device_str: str):
     from faster_whisper import WhisperModel
-    log(f"  loading ASR model {model_id} on {device_str} (first call for this key)")
-    t0 = time.time()
+    log(f"  loading fallback ASR model {model_id} on {device_str}")
     ct2_path = _ct2_model_path(model_id)
     if device_str.startswith("cuda"):
         device, device_index, compute_type = "cuda", int(device_str.split(":")[-1]), "float16"
     else:
         device, device_index, compute_type = "cpu", 0, "int8"
-    model = WhisperModel(ct2_path, device=device, device_index=device_index,
-                         compute_type=compute_type)
-    log(f"  ASR model {model_id} ready on {device_str} in {time.time() - t0:.0f}s")
-    return model
+    return WhisperModel(ct2_path, device=device, device_index=device_index, compute_type=compute_type)
 
 
-def get_asr_pipeline(lang_code: str, device_str: str):
-    """Cached per (model, device) — same lazy-singleton pattern as the
-    diarization/separation model caches, so concurrent GPU workers each get
-    their own model instance without racing on first load."""
-    model_id = ASR_LANG_MODEL.get(lang_code, ASR_DEFAULT_MODEL)
-    return model_id, _get_or_load(_asr_cache, (model_id, device_str),
-                                   lambda: _load_asr_pipeline(model_id, device_str))
+def get_whisper_pipeline(lang_code: str, device_str: str):
+    model_id = WHISPER_LANG_MODEL.get(lang_code, WHISPER_DEFAULT_MODEL)
+    return model_id, _get_or_load(_whisper_cache, (model_id, device_str),
+                                   lambda: _load_whisper_pipeline(model_id, device_str))
 
 
-def transcribe_file(wav_path: Path, lang_code: str, device_str: str):
-    """Returns (model_id, [{'word', 'start', 'end'}, ...]).
-
-    faster-whisper's CTranslate2 runtime handles long-form audio internally
-    (sequential windows, bounded memory by design) — no manual chunking
-    needed, unlike the raw HF transformers pipeline this replaced (which
-    leaked GPU memory across a whole file's cross-attention state; see git
-    history / commit notes if resurrecting that path is ever considered).
-    Timestamps are already in the file's absolute timeline, which lines up
-    with segments.jsonl/diarization.rttm since spk0.wav/spk1.wav are never
-    time-shifted relative to the original mixture."""
-    model_id, model = get_asr_pipeline(lang_code, device_str)
+def _whisper_fallback_transcribe(wav_path: Path, lang_code: str, device_str: str):
+    model_id, model = get_whisper_pipeline(lang_code, device_str)
     segments, _info = model.transcribe(
-        str(wav_path), word_timestamps=True, beam_size=1,
-        language=lang_code or None,
-    )
+        str(wav_path), word_timestamps=True, beam_size=1, language=lang_code or None)
     words = [
         {"word": w.word.strip(), "start": round(float(w.start), 3), "end": round(float(w.end), 3)}
         for seg in segments for w in (seg.words or [])
     ]
     return model_id, words
+
+
+def transcribe_file(wav_path: Path, lang_code: str, device_str: str):
+    """Returns (model_id, [{'word', 'start', 'end'}, ...]).
+
+    ASR: bodhan-ai/indic-transcribe-core (native Devanagari, no chunking
+    needed on our side -- long_form.transcribe_long already handles long
+    audio internally). Word timestamps: CTC forced alignment (real uroman
+    romanization + the package's ONNX aligner), run in an isolated
+    subprocess (see AlignmentWorker above) so a crash there costs only this
+    clip's timestamps, never the whole transcription run.
+
+    On crash/timeout, falls back to the legacy faster-whisper pipeline for
+    real word-level timestamps on just this clip (rather than the new
+    pipeline's own text with fake evenly-spaced timing). If even that fails,
+    last resort is evenly-spaced estimated timestamps, flagged via the
+    'approx_timestamps' key so any downstream consumer that needs real word
+    timing can filter these out. The returned model_id reflects whichever
+    path actually produced the words, so fallback clips stay traceable."""
+    asr = get_asr_pipeline(device_str)  # side effect: puts long_form.py's dir on sys.path
+    from long_form import transcribe_long
+    text = transcribe_long(asr, str(wav_path), lang=lang_code or "hi", mode="native")
+
+    words_out, err = get_alignment_worker(device_str).align(str(wav_path), text)
+    if words_out is not None:
+        return ASR_MODEL_ID, words_out
+
+    log(f"  [{wav_path.name}] alignment failed ({err}) -- falling back to legacy Whisper ASR+timestamps for this clip", "WARN")
+    try:
+        return _whisper_fallback_transcribe(wav_path, lang_code, device_str)
+    except Exception as e:
+        log(f"  [{wav_path.name}] Whisper fallback ALSO failed ({str(e)[:200]}) -- using evenly-spaced estimated timestamps as last resort", "WARN")
+        toks = [w for w in text.split() if w.strip()]
+        dur = sf.info(str(wav_path)).duration if toks else 0.0
+        step = dur / len(toks) if toks else 0.0
+        words_out = [
+            {"word": w, "start": round(i * step, 3), "end": round((i + 1) * step, 3), "approx_timestamps": True}
+            for i, w in enumerate(toks)
+        ]
+        return ASR_MODEL_ID, words_out
 
 
 def transcribe_one(vid_dir: Path, device_str: str, overwrite: bool = False):
@@ -1411,7 +1923,10 @@ def main():
                         "overlap leakage.")
     r.add_argument("--sidon-script", default="./dialogue_sidon_infer.py")
     r.add_argument("--sidon-steps", type=int, default=30, help="diffusion steps")
-    r.add_argument("--api-key", default=NVIDIA_API_KEY)
+    r.add_argument("--api-key", default=NVIDIA_API_KEY,
+                   help="Nemotron NIM API key(s). Comma-separate multiple keys to "
+                        "spread verify calls across accounts — raise --verify-concurrency "
+                        "roughly proportionally when you do.")
     r.add_argument("--limit", type=int, default=0)
     r.add_argument("--cc-only", action="store_true")
     r.add_argument("--keep-raw", action="store_true", help="keep the source mixture in raw/")

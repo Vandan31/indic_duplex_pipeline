@@ -23,3 +23,9 @@ venv/
 cookies.txt
 .ct2_models/
 .pip-cache/
+*.pyc
+*.out
+*.err
+batch_*.jsonl
+batch_wrapper_*.log
+smoke_test_*

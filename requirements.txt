@@ -13,11 +13,31 @@ huggingface_hub>=0.30
 silero-vad>=5.0
 
 # transcription (word-level timestamps)
-# faster-whisper (CTranslate2) — a raw transformers ASR pipeline was tried
-# first but leaks GPU memory across a long file's word-timestamp extraction
-# (confirmed via repeated OOM at ~31GB on a 3-minute clip); faster-whisper's
-# runtime doesn't have that problem and is the standard tool for this.
+# bodhan-ai/indic-transcribe-core (gated HF repo -- request access and set
+# HF_TOKEN in .env) replaces the earlier per-language faster-whisper
+# fine-tunes: single model covers all 27 Indic languages natively, and
+# validated substantially lower decoder-loop repetition and zero stuck word
+# timestamps vs the old pipeline on a 200-clip audit (2026-09-24).
+transformers>=4.40
+# forced alignment for word-level timestamps: real uroman romanization +
+# the package's own ONNX aligner (NOT its built-in preprocess_text(romanize=
+# True), which silently falls back to unidecode instead of real uroman for
+# Devanagari). Runs in an isolated subprocess (see AlignmentWorker in
+# duplex_corpus.py) since it has been observed to crash natively
+# (SIGABRT/SIGSEGV inside onnxruntime/torch) under memory pressure on long
+# clips -- isolation means that only costs one clip's timestamps, not the
+# whole run.
+uroman>=1.3
+ctc-forced-aligner>=1.0.2
+# NOTE: the onnxruntime pulled in transitively here is CPU-only in the
+# current venv (no CUDAExecutionProvider) -- alignment is the slow half of
+# the pipeline (median ~130s/clip) as a result. Installing onnxruntime-gpu
+# instead is an open, untested speed optimization, not yet required.
+
+# legacy fallback ASR: only invoked for the small minority of clips (~2.5%
+# in validation) whose new-pipeline alignment crashes even in an isolated
+# subprocess -- gives real word timestamps for just that clip instead of
+# linear interpolation. Not the default path; see transcribe_file().
 faster-whisper>=1.0
-transformers>=4.40  # only used by ct2-transformers-converter for the one-time model conversion
 
 # system requirement: ffmpeg and ffprobe on PATH
