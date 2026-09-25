@@ -175,19 +175,37 @@ model selection needed). Word-level timestamps come from CTC forced alignment
 `romanize=True` option, which silently uses `unidecode` instead of real
 uroman for Devanagari and produces wrong alignments).
 
-The alignment step has been observed to crash natively (SIGABRT/SIGSEGV
-inside onnxruntime, under memory pressure on long/complex clips) — it runs in
-an isolated subprocess so that only costs one clip's timestamps, never the
-whole `transcribe` run. If it crashes or times out for a clip, that one clip
-automatically falls back to `faster-whisper` (real word timestamps, just
-inheriting that model's known decoder-loop/timestamp-collapse quirks — this
-was the pipeline's previous default, kept only as this rare-path fallback
-now) and, if even that fails, to evenly-spaced estimated timestamps flagged
-with `"approx_timestamps": true` per word so they're easy to filter out
-downstream. Validated against the old all-Whisper pipeline on a 200-clip
-random sample (2026-09-24): ~1% mean 4-gram repetition rate vs ~7% for
-Whisper, and no stuck/duplicate word timestamps vs ~78% of Whisper clips
-affected — see the git history for the full comparison writeup if useful.
+**Long clips and crash-safety.** Forced alignment used to crash natively
+(SIGABRT/SIGSEGV inside onnxruntime) on long clips, because the alignment DP
+ran over the whole clip in one shot, so memory/compute grew with clip length
+(crash rate hit ~47% on a stretch of ~28-minute clips). Two fixes are built in:
+
+- **Chunked alignment:** every clip is split into pieces of at most 8 minutes
+  (audio by time, transcript proportionally by word position) and each piece
+  is aligned independently, so no single alignment call ever sees a long
+  clip. After this fix, 0 crashes in 273 consecutive clips, and alignment got
+  faster too (e.g. 832s -> 407s on a 25-minute clip). No duration cap is
+  needed — clips of any length get real alignment.
+- **Capped onnxruntime threads (8 per alignment worker):** left alone,
+  onnxruntime sized its thread pool to the node's full core count (~110
+  threads per worker), which oversubscribed the CPUs once several GPU workers
+  ran at once. Note that alignment runs on CPU in this setup (the installed
+  onnxruntime has no CUDA provider), so with many `--gpus` workers make sure
+  the machine has roughly 8+ free CPU cores per worker.
+
+Alignment still runs in an isolated subprocess as a backstop: if it ever
+crashes or times out for a clip, that one clip automatically falls back to
+`faster-whisper` (real word timestamps, just inheriting that model's known
+decoder-loop/timestamp-collapse quirks) and, if even that fails, to
+evenly-spaced estimated timestamps flagged with `"approx_timestamps": true`
+per word so they're easy to filter out downstream. Validated against the old
+all-Whisper pipeline on a 200-clip random sample (2026-09-24): ~1% mean
+4-gram repetition rate vs ~7% for Whisper, and no stuck/duplicate word
+timestamps vs ~78% of Whisper clips affected.
+
+Rough throughput to plan around: about 10 hours of audio per wall-clock hour
+on 8 GPUs (measured on long-clip-heavy data), so budget accordingly for a
+multi-thousand-hour corpus.
 
 Output, written to `accepted/<id>/transcript.json`:
 

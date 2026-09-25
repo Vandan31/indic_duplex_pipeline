@@ -3,6 +3,7 @@ import base64
 import contextlib
 import functools
 import json
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -1568,6 +1569,33 @@ def _alignment_worker_main(device_str, req_q, res_q):
     if device_str.startswith("cuda"):
         idx = device_str.split(":")[-1] if ":" in device_str else "0"
         os.environ["CUDA_VISIBLE_DEVICES"] = idx
+
+    # onnxruntime here is CPU-only (no CUDAExecutionProvider in this venv --
+    # see requirements.txt), and left to its own defaults it sizes its
+    # intra-op thread pool off the NODE's total core count (observed: ~110
+    # threads, matching this cluster's 112-core sockets), not the cgroup CPU
+    # allocation SLURM actually gave this job. With several concurrent
+    # alignment workers each doing this, the node's cores get oversubscribed
+    # several times over (observed load average 287 on 224 cores running
+    # 5 workers), each individual alignment call slows down from contention,
+    # and it also produces the (harmless but noisy) pthread_setaffinity_np
+    # warnings from threads trying to pin to cores outside the cgroup's mask.
+    # AlignmentSingleton doesn't expose SessionOptions to control this, so
+    # patch onnxruntime.InferenceSession to inject a capped thread count
+    # before it's ever called -- scoped to this subprocess only.
+    import onnxruntime
+    _orig_inference_session = onnxruntime.InferenceSession
+
+    def _capped_inference_session(*args, **kwargs):
+        if "sess_options" not in kwargs:
+            so = onnxruntime.SessionOptions()
+            so.intra_op_num_threads = 8
+            so.inter_op_num_threads = 1
+            kwargs["sess_options"] = so
+        return _orig_inference_session(*args, **kwargs)
+
+    onnxruntime.InferenceSession = _capped_inference_session
+
     import uroman as uroman_lib
     from ctc_forced_aligner import (
         AlignmentSingleton, generate_emissions, get_alignments, get_spans,
@@ -1586,20 +1614,70 @@ def _alignment_worker_main(device_str, req_q, res_q):
             text_starred += ["<star>", w]
         return tokens_starred, text_starred
 
+    # Root cause of the native SIGABRT/SIGSEGV crashes on long clips: the
+    # forced-alignment DP (get_alignments) runs over the FULL emission x
+    # token sequence in one shot, so its memory/compute footprint grows with
+    # the *entire* clip's length -- generate_emissions' own internal windowing
+    # (window_length=30s) doesn't help here, since it only chunks the
+    # emission generation, not the alignment DP consuming its output. A
+    # 200-clip validation (2026-09-24) and a live production run both showed
+    # crash rate rising sharply with duration (all 5 originally-found crash
+    # cases were 26-37 min clips; a later window averaging ~28 min/clip hit a
+    # ~47% crash rate). Fix: split any clip into <=ALIGN_CHUNK_SEC pieces
+    # (audio by time, transcript proportionally by word position, assuming
+    # roughly uniform speech rate within a clip) and align each piece
+    # independently -- no single alignment DP call ever sees more than a few
+    # minutes of audio, regardless of the original clip's length. Verified
+    # sizes (<=10 min) were reliably crash-free throughout all testing so
+    # far.
+    ALIGN_CHUNK_SEC = 480  # 8 min
+
+    def _align_chunk(audio_chunk, text_chunk):
+        tokens_starred, text_starred = real_preprocess(text_chunk)
+        if not tokens_starred:
+            return []
+        emissions, stride = generate_emissions(aligner.alignment_model, audio_chunk)
+        segments, scores, blank_label = get_alignments(
+            emissions, tokens_starred, aligner.alignment_tokenizer)
+        spans = get_spans(tokens_starred, segments, blank_label)
+        return postprocess_results(text_starred, spans, stride, scores)
+
+    def chunked_align(wav_path, text):
+        full_audio = load_audio(wav_path, ret_type="np")
+        total_samples = len(full_audio)
+        sr = 16000  # ctc_forced_aligner.SAMPLING_FREQ
+        total_dur = total_samples / sr
+        words = [w for w in text.split() if w.strip()]
+        if not words or total_dur <= 0:
+            return []
+
+        n_chunks = max(1, math.ceil(total_dur / ALIGN_CHUNK_SEC))
+        chunk_dur = total_dur / n_chunks
+        results = []
+        for i in range(n_chunks):
+            t0 = i * chunk_dur
+            t1 = total_dur if i == n_chunks - 1 else (i + 1) * chunk_dur
+            s0, s1 = int(t0 * sr), int(t1 * sr)
+            audio_chunk = full_audio[s0:s1]
+            w0 = int(len(words) * t0 / total_dur)
+            w1 = len(words) if i == n_chunks - 1 else int(len(words) * t1 / total_dur)
+            chunk_words = words[w0:w1]
+            if not chunk_words or len(audio_chunk) == 0:
+                continue
+            word_ts = _align_chunk(audio_chunk, " ".join(chunk_words))
+            for w in word_ts:
+                results.append({
+                    "word": w["text"],
+                    "start": round(float(w["start"]) + t0, 3),
+                    "end": round(float(w["end"]) + t0, 3),
+                })
+        return results
+
     while True:
         wav_path, text = req_q.get()
         try:
-            audio_waveform = load_audio(wav_path, ret_type="np")
-            emissions, stride = generate_emissions(aligner.alignment_model, audio_waveform)
-            tokens_starred, text_starred = real_preprocess(text)
-            segments, scores, blank_label = get_alignments(
-                emissions, tokens_starred, aligner.alignment_tokenizer)
-            spans = get_spans(tokens_starred, segments, blank_label)
-            word_ts = postprocess_results(text_starred, spans, stride, scores)
-            res_q.put(("ok", [
-                {"word": w["text"], "start": round(float(w["start"]), 3), "end": round(float(w["end"]), 3)}
-                for w in word_ts
-            ]))
+            word_ts = chunked_align(wav_path, text)
+            res_q.put(("ok", word_ts))
         except Exception as e:
             res_q.put(("error", f"{type(e).__name__}: {str(e)[:300]}"))
 
