@@ -269,6 +269,19 @@ Related work: [DuplexChat](https://github.com/sarulab-speech/DuplexChat)
 (Nakata et al., arXiv:2607.04941) builds a comparable corpus for English and
 Japanese from podcast RSS feeds, at far larger scale.
 
+## Changelog
+
+- **2026-09-26 — Chunking updated in annotation (`transcribe` stage).** Forced
+  alignment now splits each clip into pieces of at most 8 minutes and aligns
+  them independently, instead of aligning the whole clip in one shot. This
+  removes the native alignment crashes on long clips and is faster. If you
+  annotated data with an earlier version of this repo, clips that ended up
+  with a Whisper model in `transcript.json`'s `models` field were fallbacks
+  from those crashes and are worth re-running with `--overwrite` after
+  pulling. Also caps onnxruntime at 8 threads per alignment worker.
+- **2026-09-24 — Initial `transcribe` stage:** `indic-transcribe-core` ASR +
+  CTC forced alignment, with crash-isolated alignment and Whisper fallback.
+
 ## License
 
 MIT for this code. Models and datasets carry their own licenses, and crawled
