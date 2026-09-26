@@ -87,8 +87,12 @@ for `discover`/`run`, and separately the gated
 [`bodhan-ai/indic-transcribe-core`](https://huggingface.co/bodhan-ai/indic-transcribe-core)
 repo accepted for `transcribe` — request access on its HF page with the same
 account this token belongs to; approval is usually quick but isn't instant.
-**If you only need `transcribe` (see below), that's the only gated repo you
-need approved — you don't need the pyannote/DialogueSidon ones.**
+`transcribe` also uses
+[`ai4bharat/indicwav2vec-hindi`](https://huggingface.co/ai4bharat/indicwav2vec-hindi)
+for alignment; that one is auto-approved — just open its page while logged in
+with the same account and click to accept the access terms.
+**If you only need `transcribe` (see below), those two are the only gated
+repos you need — you don't need the pyannote/DialogueSidon ones.**
 
 DialogueSidon inference needs the authors' script, which is not redistributed
 here — get it from
@@ -169,43 +173,50 @@ script) to match rather than reworking the pipeline.
 **Pipeline:** ASR is
 [`bodhan-ai/indic-transcribe-core`](https://huggingface.co/bodhan-ai/indic-transcribe-core)
 (single model, native output across 27 Indic languages — no per-language
-model selection needed). Word-level timestamps come from CTC forced alignment
-(real [`uroman`](https://pypi.org/project/uroman/) romanization feeding the
-`ctc-forced-aligner` package's ONNX aligner — *not* that package's own
-`romanize=True` option, which silently uses `unidecode` instead of real
-uroman for Devanagari and produces wrong alignments).
+model selection needed). Word-level timestamps come from CTC forced
+alignment with
+[`ai4bharat/indicwav2vec-hindi`](https://huggingface.co/ai4bharat/indicwav2vec-hindi)
+(Apache-2.0, native Devanagari vocabulary, so no romanization step) via
+`torchaudio.functional.forced_align`, on the GPU.
 
-**Long clips and crash-safety.** Forced alignment used to crash natively
-(SIGABRT/SIGSEGV inside onnxruntime) on long clips, because the alignment DP
-ran over the whole clip in one shot, so memory/compute grew with clip length
-(crash rate hit ~47% on a stretch of ~28-minute clips). Two fixes are built in:
+**Long clips.** The model's memory grows linearly with audio length (a 3.4-hour
+clip tried to allocate 75 GiB in one tensor), so the *emission* is computed in
+overlapping 5-minute windows (10 s of context each side, discarded) and
+concatenated, and then the alignment runs **once, globally**, over the whole
+clip's emission and full transcript. There is deliberately no per-chunk
+transcript splitting: an earlier version (commits `6aecf68` and `33c1cfb`)
+split the transcript in proportion to time, which assumes speech is spread
+evenly. On separated speaker channels it isn't, and on one 15-minute test clip
+about 30% of the words were assigned to the wrong time window. If you ran the
+`transcribe` stage with those commits, re-run clips longer than 8 minutes
+after pulling.
 
-- **Chunked alignment:** every clip is split into pieces of at most 8 minutes
-  (audio by time, transcript proportionally by word position) and each piece
-  is aligned independently, so no single alignment call ever sees a long
-  clip. After this fix, 0 crashes in 273 consecutive clips, and alignment got
-  faster too (e.g. 832s -> 407s on a 25-minute clip). No duration cap is
-  needed — clips of any length get real alignment.
-- **Capped onnxruntime threads (8 per alignment worker):** left alone,
-  onnxruntime sized its thread pool to the node's full core count (~110
-  threads per worker), which oversubscribed the CPUs once several GPU workers
-  ran at once. Note that alignment runs on CPU in this setup (the installed
-  onnxruntime has no CUDA provider), so with many `--gpus` workers make sure
-  the machine has roughly 8+ free CPU cores per worker.
+Measured on 31 clips (2 minutes to 3.4 hours) against the old CPU ONNX aligner:
+about 2.6x faster alignment (about 1.8x end-to-end, since ASR becomes about
+half of the per-file time), and far fewer words placed on silent audio (2-3%
+vs 5-36% on clips over 8 minutes). Quality is judged with ground-truth-free
+proxies (word-duration plausibility, agreement with audio energy) — there is
+no hand-labelled timestamp data, so spot-check some clips before relying on
+sub-100 ms accuracy.
+
+Words the aligner's vocabulary cannot represent (other scripts, digits) are
+kept in the transcript with timestamps interpolated between their aligned
+neighbours and flagged `"approx_timestamps": true`, rather than dropped.
 
 Alignment still runs in an isolated subprocess as a backstop: if it ever
-crashes or times out for a clip, that one clip automatically falls back to
+crashes or fails for a clip, that one clip automatically falls back to
 `faster-whisper` (real word timestamps, just inheriting that model's known
 decoder-loop/timestamp-collapse quirks) and, if even that fails, to
-evenly-spaced estimated timestamps flagged with `"approx_timestamps": true`
-per word so they're easy to filter out downstream. Validated against the old
-all-Whisper pipeline on a 200-clip random sample (2026-09-24): ~1% mean
-4-gram repetition rate vs ~7% for Whisper, and no stuck/duplicate word
-timestamps vs ~78% of Whisper clips affected.
+evenly-spaced estimated timestamps flagged with `"approx_timestamps": true`.
+The previous CPU ONNX + uroman aligner is still available with
+`ALIGN_BACKEND=onnx` for reference, but it is not recommended for clips longer
+than a few minutes. Validated against the old all-Whisper pipeline on a
+200-clip random sample (2026-09-24): ~1% mean 4-gram repetition rate vs ~7%
+for Whisper, and no stuck/duplicate word timestamps vs ~78% of Whisper clips
+affected.
 
-Rough throughput to plan around: about 10 hours of audio per wall-clock hour
-on 8 GPUs (measured on long-clip-heavy data), so budget accordingly for a
-multi-thousand-hour corpus.
+Rough throughput to plan around: with the previous aligner about 10 hours of
+audio per wall-clock hour on 8 GPUs; expect roughly double with this one.
 
 Output, written to `accepted/<id>/transcript.json`:
 
@@ -214,6 +225,9 @@ Output, written to `accepted/<id>/transcript.json`:
   "id": "...",
   "language_code": "hi",
   "models": {"spk0": "bodhan-ai/indic-transcribe-core", "spk1": "..."},
+  "aligner": "iwv",
+  "asr_stats": {"spk0": {"n_letters": 5210, "devanagari_frac": 0.998, "n_asr_words": 1204, "n_approx_words": 3}},
+  "suspect_language": false,
   "words": [{"speaker": "SPEAKER_00", "word": "...", "start": 1.23, "end": 1.45}, ...],
   "turns": [{"speaker": "SPEAKER_00", "start": 1.2, "end": 4.5, "text": "..."}, ...]
 }
@@ -223,7 +237,12 @@ Output, written to `accepted/<id>/transcript.json`:
 `bodhan-ai/indic-transcribe-core` for the normal path, a `vasista22/whisper-*`
 or `openai/whisper-large-v3` id if that clip hit the Whisper fallback. Check
 this field (or the per-word `approx_timestamps` flag) if you need to exclude
-fallback clips from anything timestamp-sensitive.
+fallback clips from anything timestamp-sensitive. `aligner` is `iwv`
+(IndicWav2Vec, current) or `onnx` (legacy) — use it to find clips annotated by
+an older version. `suspect_language` is true when a speaker's transcript is
+under 50% Devanagari letters (with at least 50 letters), which usually means
+the audio is not Hindi (a language-verification false positive); filter these
+before training on a Hindi-only set.
 
 Resumable — rerun the same command after an interruption and it continues.
 `stats` breaks rejections down by reason, which is how you tune thresholds: if
@@ -271,6 +290,18 @@ Japanese from podcast RSS feeds, at far larger scale.
 
 ## Changelog
 
+- **2026-09-26 (later) — Alignment switched to IndicWav2Vec, global instead of
+  chunked.** The proportional chunking below turned out to misplace words on
+  long clips (speech is not evenly spread over a clip, so words were forced
+  into the wrong chunk; on one clip ~30% of words). Alignment now uses
+  `ai4bharat/indicwav2vec-hindi` on GPU with windowed emissions and one global
+  alignment per clip: no transcript splitting, no crashes on long clips, about
+  2x faster end-to-end. **If you annotated clips longer than 8 minutes with
+  commits `6aecf68` / `33c1cfb`, re-run them after pulling.** `transcript.json`
+  now also records `aligner`, per-speaker `asr_stats` and a `suspect_language`
+  flag; words the aligner cannot place are kept with interpolated timestamps
+  and `approx_timestamps: true`. Accept the terms for the new model on its HF
+  page (auto-approved) before your first run.
 - **2026-09-26 — Chunking updated in annotation (`transcribe` stage).** Forced
   alignment now splits each clip into pieces of at most 8 minutes and aligns
   them independently, instead of aligning the whole clip in one shot. This

@@ -1558,8 +1558,14 @@ _alignment_workers_lock = threading.Lock()
 ALIGN_TIMEOUT_SEC = 1800  # 30 min wall-clock ceiling per clip's alignment call
 
 
-def _alignment_worker_main(device_str, req_q, res_q):
-    """Runs in an isolated child process. Loads the aligner once, then serves
+def _onnx_alignment_loop(device_str, req_q, res_q):
+    """Legacy backend (ALIGN_BACKEND=onnx): CPU ONNX aligner + uroman, chunked
+    by proportional transcript splitting. Kept for reference/fallback only --
+    the proportional split misplaces words on clips whose speech is unevenly
+    spread over time (e.g. separated speaker channels with long silences),
+    so IndicWav2Vec (below) is the default.
+
+    Runs in an isolated child process. Loads the aligner once, then serves
     align requests until killed. A native crash here only takes down this
     process -- the parent (AlignmentWorker.align) detects it and respawns."""
     # AlignmentSingleton's onnxruntime session has no device kwarg -- it
@@ -1680,6 +1686,160 @@ def _alignment_worker_main(device_str, req_q, res_q):
             res_q.put(("ok", word_ts))
         except Exception as e:
             res_q.put(("error", f"{type(e).__name__}: {str(e)[:300]}"))
+
+
+def _interpolate_unaligned(all_words, aligned_by_idx, total_dur):
+    """Full word list in transcript order. Words the aligner could not place
+    (no characters in its vocabulary: other scripts, digits, punctuation-only)
+    are kept, not dropped, with timestamps spread evenly across the gap between
+    their aligned neighbours and flagged 'approx_timestamps': True."""
+    n = len(all_words)
+    res = [None] * n
+    for i, (s, e) in aligned_by_idx.items():
+        res[i] = {"word": all_words[i], "start": s, "end": e}
+    i = 0
+    while i < n:
+        if res[i] is not None:
+            i += 1
+            continue
+        j = i
+        while j < n and res[j] is None:
+            j += 1
+        t0 = res[i - 1]["end"] if i > 0 else 0.0
+        t1 = max(res[j]["start"] if j < n else total_dur, t0)
+        step = (t1 - t0) / (j - i)
+        for k in range(i, j):
+            res[k] = {"word": all_words[k], "start": round(t0 + (k - i) * step, 3),
+                      "end": round(t0 + (k - i + 1) * step, 3), "approx_timestamps": True}
+        i = j
+    return res
+
+
+IWV_MODEL_ID = "ai4bharat/indicwav2vec-hindi"
+IWV_WINDOW_SEC = 300     # model forward pass runs on windows of this length...
+IWV_CONTEXT_SEC = 10     # ...with this much extra audio each side, then discarded
+IWV_GPU_TRELLIS_CELLS = 70e9  # T*(2L+1) above this -> run forced_align on CPU
+
+
+def _iwv_alignment_loop(device_str, req_q, res_q):
+    """Default backend: AI4Bharat's indicwav2vec-hindi (Hindi CTC model with a
+    native Devanagari vocabulary -- no romanization) + torchaudio forced_align,
+    on GPU, in an isolated child process.
+
+    Long clips: the model's CNN front-end and attention memory grow linearly
+    with audio length (a 3.4h clip tried to allocate 75 GiB in one tensor), so
+    the *emission* is computed in overlapping windows and concatenated, but
+    the alignment itself is ONE global forced_align over the whole clip's
+    emission and full transcript -- no per-chunk transcript splitting, so a
+    word can never be assigned to the wrong time window (the failure mode of
+    proportional splitting when speech is unevenly spread over the clip).
+    If the alignment trellis (T x (2L+1)) would not fit on the GPU it falls
+    back to CPU for that clip."""
+    import unicodedata
+    import librosa
+    import torch
+    import torchaudio.functional as F
+    from transformers import AutoModelForCTC, Wav2Vec2CTCTokenizer, Wav2Vec2FeatureExtractor
+
+    # Use the explicit device index rather than CUDA_VISIBLE_DEVICES: under
+    # multiprocessing 'spawn' this module's top-level code (and torch's CUDA
+    # init) has already run by the time we get here, so changing the env var
+    # now would not re-pin the process.
+    dev = torch.device(device_str if device_str.startswith("cuda") and torch.cuda.is_available() else "cpu")
+    if dev.type == "cuda":
+        # torchaudio's forced_align is a custom CUDA kernel that launches on the
+        # *current* device, not the device its tensors live on; with several GPUs
+        # visible and dev != cuda:0 it hits "illegal memory access" unless the
+        # current device is set explicitly.
+        torch.cuda.set_device(dev)
+    tok = Wav2Vec2CTCTokenizer.from_pretrained(IWV_MODEL_ID)
+    fe = Wav2Vec2FeatureExtractor.from_pretrained(IWV_MODEL_ID)
+    model = AutoModelForCTC.from_pretrained(IWV_MODEL_ID).to(dev).eval()
+    vocab = tok.get_vocab()
+    blank_id = vocab.get(tok.pad_token, 0)
+    delim_id = vocab.get("|")
+    use_delim = os.environ.get("IWV_USE_DELIM", "1") == "1" and delim_id is not None
+    sr, hop = 16000, 320  # 20 ms frames; window/context are multiples of hop
+    win, ctx = IWV_WINDOW_SEC * sr, IWV_CONTEXT_SEC * sr
+
+    def emission_for(wav_path):
+        wave = librosa.load(wav_path, sr=sr, mono=True)[0].astype("float32")
+        n = len(wave)
+        inp = fe(wave, sampling_rate=sr, return_tensors="pt").input_values[0]  # normalized over the whole clip
+        outs, s = [], 0
+        while s < n:
+            e = min(s + win, n)
+            a, b = max(0, s - ctx), min(n, e + ctx)
+            with torch.inference_mode():
+                lg = model(inp[a:b].unsqueeze(0).to(dev)).logits[0].float()
+            lg = torch.log_softmax(lg, dim=-1)
+            f0 = (s - a) // hop
+            n_core = lg.size(0) - f0 if e >= n else (e - s) // hop
+            outs.append(lg[f0:f0 + n_core])
+            s = e
+        return torch.cat(outs, dim=0), n
+
+    def align_words(wav_path, text):
+        emission, n_samples = emission_for(wav_path)
+        T = emission.size(0)
+        all_words = text.split()
+        words, ids_per_word, kept_idx = [], [], []
+        for wi, w in enumerate(all_words):
+            ids = [vocab[c] for c in unicodedata.normalize("NFC", w)
+                   if c in vocab and vocab[c] != blank_id and c != "|"]
+            if ids:
+                words.append(w)
+                ids_per_word.append(ids)
+                kept_idx.append(wi)
+        if not words:
+            # nothing alignable (e.g. transcript entirely in another script)
+            return _interpolate_unaligned(all_words, {}, n_samples / sr)
+        targets = []
+        for i, ids in enumerate(ids_per_word):
+            if use_delim and i > 0:
+                targets.append(delim_id)
+            targets.extend(ids)
+        L = len(targets)
+        tgt = torch.tensor([targets], dtype=torch.int32)
+        aligned = None
+        if emission.is_cuda and T * (2 * L + 1) <= IWV_GPU_TRELLIS_CELLS:
+            try:
+                aligned, scores = F.forced_align(emission.unsqueeze(0), tgt.to(emission.device), blank=blank_id)
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                aligned = None
+        if aligned is None:
+            aligned, scores = F.forced_align(emission.unsqueeze(0).cpu(), tgt, blank=blank_id)
+        spans = F.merge_tokens(aligned[0], scores[0])
+        if len(spans) != L:
+            raise RuntimeError(f"alignment produced {len(spans)} token spans for {L} targets")
+        ratio = n_samples / T
+        aligned_by_idx, k = {}, 0
+        for i, ids in enumerate(ids_per_word):
+            if use_delim and i > 0:
+                k += 1
+            sp = spans[k:k + len(ids)]
+            k += len(ids)
+            aligned_by_idx[kept_idx[i]] = (round(int(ratio * sp[0].start) / sr, 3),
+                                           round(int(ratio * sp[-1].end) / sr, 3))
+        return _interpolate_unaligned(all_words, aligned_by_idx, n_samples / sr)
+
+    while True:
+        wav_path, text = req_q.get()
+        try:
+            res_q.put(("ok", align_words(wav_path, text)))
+        except Exception as e:
+            res_q.put(("error", f"{type(e).__name__}: {str(e)[:300]}"))
+        finally:
+            if dev.type == "cuda":
+                torch.cuda.empty_cache()
+
+
+def _alignment_worker_main(device_str, req_q, res_q):
+    if os.environ.get("ALIGN_BACKEND", "iwv") == "onnx":
+        _onnx_alignment_loop(device_str, req_q, res_q)
+    else:
+        _iwv_alignment_loop(device_str, req_q, res_q)
 
 
 class AlignmentWorker:
@@ -1824,15 +1984,32 @@ def _whisper_fallback_transcribe(wav_path: Path, lang_code: str, device_str: str
     return model_id, words
 
 
-def transcribe_file(wav_path: Path, lang_code: str, device_str: str):
+def _script_stats(text: str) -> dict:
+    """Share of Devanagari among the letters of an ASR transcript. A clip
+    labeled Hindi whose transcript is mostly Gujarati/Bengali/... script is
+    probably not Hindi audio (language-verification false positive)."""
+    dev = other = 0
+    for ch in text:
+        o = ord(ch)
+        if 0x0900 <= o <= 0x097F:
+            dev += 1
+        elif 0x0980 <= o <= 0x0DFF or 0x0600 <= o <= 0x06FF or ch.isascii() and ch.isalpha():
+            other += 1
+    return {"n_letters": dev + other, "devanagari_frac": round(dev / (dev + other), 4) if dev + other else None}
+
+
+def transcribe_file(wav_path: Path, lang_code: str, device_str: str, stats_out: dict = None):
     """Returns (model_id, [{'word', 'start', 'end'}, ...]).
+
+    If `stats_out` is given it is filled with per-file script statistics
+    (see _script_stats) and word counts.
 
     ASR: bodhan-ai/indic-transcribe-core (native Devanagari, no chunking
     needed on our side -- long_form.transcribe_long already handles long
-    audio internally). Word timestamps: CTC forced alignment (real uroman
-    romanization + the package's ONNX aligner), run in an isolated
-    subprocess (see AlignmentWorker above) so a crash there costs only this
-    clip's timestamps, never the whole transcription run.
+    audio internally). Word timestamps: CTC forced alignment
+    (ai4bharat/indicwav2vec-hindi by default, see _iwv_alignment_loop), run
+    in an isolated subprocess (see AlignmentWorker above) so a crash there
+    costs only this clip's timestamps, never the whole transcription run.
 
     On crash/timeout, falls back to the legacy faster-whisper pipeline for
     real word-level timestamps on just this clip (rather than the new
@@ -1844,9 +2021,14 @@ def transcribe_file(wav_path: Path, lang_code: str, device_str: str):
     asr = get_asr_pipeline(device_str)  # side effect: puts long_form.py's dir on sys.path
     from long_form import transcribe_long
     text = transcribe_long(asr, str(wav_path), lang=lang_code or "hi", mode="native")
+    if stats_out is not None:
+        stats_out.update(_script_stats(text))
+        stats_out["n_asr_words"] = len(text.split())
 
     words_out, err = get_alignment_worker(device_str).align(str(wav_path), text)
     if words_out is not None:
+        if stats_out is not None:
+            stats_out["n_approx_words"] = sum(1 for w in words_out if w.get("approx_timestamps"))
         return ASR_MODEL_ID, words_out
 
     log(f"  [{wav_path.name}] alignment failed ({err}) -- falling back to legacy Whisper ASR+timestamps for this clip", "WARN")
@@ -1882,15 +2064,18 @@ def transcribe_one(vid_dir: Path, device_str: str, overwrite: bool = False):
     speaker_map = meta.get("speaker_map") or {"spk0": "SPEAKER_00", "spk1": "SPEAKER_01"}
 
     models = {}
+    asr_stats = {}
     all_words = []
     for spk in ("spk0", "spk1"):
         wav = vid_dir / f"{spk}.wav"
         if not wav.exists():
             continue
         try:
-            model_id, words = transcribe_file(wav, lang_code, device_str)
+            asr_stats[spk] = {}
+            model_id, words = transcribe_file(wav, lang_code, device_str, stats_out=asr_stats[spk])
         except Exception as e:
             log(f"  [{vid_dir.name}] transcribe {spk} failed: {str(e)[:200]}", "WARN")
+            asr_stats.pop(spk, None)
             continue
         models[spk] = model_id
         speaker = speaker_map.get(spk, spk)
@@ -1917,10 +2102,18 @@ def transcribe_one(vid_dir: Path, device_str: str, overwrite: bool = False):
                 "text": " ".join(w["word"] for w in turn_words),
             })
 
+    # A speaker channel needs enough text to judge; a near-silent channel
+    # proves nothing either way.
+    suspect_language = any(
+        s.get("n_letters", 0) >= 50 and (s.get("devanagari_frac") or 0) < 0.5
+        for s in asr_stats.values())
     record = {
         "id": meta.get("id"),
         "language_code": lang_code,
         "models": models,
+        "aligner": os.environ.get("ALIGN_BACKEND", "iwv"),
+        "asr_stats": asr_stats,
+        "suspect_language": suspect_language,
         "words": all_words,
         "turns": turns,
     }
