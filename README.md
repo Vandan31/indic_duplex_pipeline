@@ -234,6 +234,7 @@ Output, written to `accepted/<id>/transcript.json`:
   "language_code": "hi",
   "models": {"spk0": "bodhan-ai/indic-transcribe-core", "spk1": "..."},
   "aligner": "iwv",
+  "end_fix": "v1",
   "asr_stats": {"spk0": {"n_letters": 5210, "devanagari_frac": 0.998, "n_asr_words": 1204, "n_approx_words": 3}},
   "suspect_language": false,
   "words": [{"speaker": "SPEAKER_00", "word": "...", "start": 1.23, "end": 1.45}, ...],
@@ -245,7 +246,14 @@ Output, written to `accepted/<id>/transcript.json`:
 `bodhan-ai/indic-transcribe-core` for the normal path, a `vasista22/whisper-*`
 or `openai/whisper-large-v3` id if that clip hit the Whisper fallback. Check
 this field (or the per-word `approx_timestamps` flag) if you need to exclude
-fallback clips from anything timestamp-sensitive. `aligner` is `iwv`
+fallback clips from anything timestamp-sensitive. **Word start times are the
+reliable field.** CTC alignment marks where each character's sound peaks, so a
+raw word span runs only from its first to its last character peak and ends
+early (median 0.15 s, ~4% of words under 40 ms). `end_fix: "v1"` means each word's
+end has been extended toward the next word's start (fully if the gap is at most
+0.25 s, otherwise by 0.10 s into the pause, never across the next word), which
+brings the median to ~0.22 s and words under 40 ms to ~0.06%. Ends are still
+approximate. `aligner` is `iwv`
 (IndicWav2Vec, current) or `onnx` (legacy) — use it to find clips annotated by
 an older version. `suspect_language` is true when a speaker's transcript is
 under 50% Devanagari letters (with at least 50 letters), which usually means
@@ -298,6 +306,15 @@ Japanese from podcast RSS feeds, at far larger scale.
 
 ## Changelog
 
+- **2026-09-26 (evening) — Word end times extended.** Raw CTC word spans end
+  systematically early (they cover only first-to-last character peak: median
+  0.15 s, ~4% of words under 40 ms). Each word's end is now extended toward the
+  next word's start (gap up to 0.25 s closed entirely, longer pauses get a 0.10 s
+  tail, never across the next word). Parameters were chosen by measurement against
+  audio energy on 80 delivered speaker channels: speech not covered by any word
+  fell from 37.7% to 14.4%. Transcripts carry `"end_fix": "v1"`; ones written by
+  earlier versions lack it, and can be brought up to date from their word lists
+  alone with the same rule (`_extend_word_ends`).
 - **2026-09-26 (latest) — One worker process per GPU.** `transcribe --gpus
   0,1,2,3` previously ran its GPU workers as threads in one process, which the
   interpreter lock capped at ~10 audio-hours/hour regardless of GPU count. It now

@@ -1715,6 +1715,37 @@ def _interpolate_unaligned(all_words, aligned_by_idx, total_dur):
     return res
 
 
+# Chosen by measurement on 80 delivered speaker channels against audio energy:
+# speech not covered by any word 37.7% -> 14.4%, median word 0.15 -> 0.23 s,
+# words <40 ms 3.6% -> 0.1%, lowest combined over-extension/uncovered cost.
+# Longer settings mostly add silence.
+END_GAP_FILL_SEC = 0.25   # gap to the next word up to this: close it entirely
+END_TAIL_SEC = 0.10       # larger gap (a pause): extend only this far past the CTC end
+
+
+def _extend_word_ends(words, total_dur=None, gap_fill=END_GAP_FILL_SEC, tail=END_TAIL_SEC):
+    """CTC forced alignment marks where each character's sound peaks, so a
+    word's span covers only first-to-last character peak: its END is
+    systematically early (median word ~0.15 s; ~4% under 40 ms) while its START
+    is reliable. Extend each word's end toward the next word's start: fully if
+    the gap is <= gap_fill, otherwise by `tail` (the decay of the last sound)
+    into the pause. Never crosses the next word, so words never overlap.
+    Interpolated words (approx_timestamps) already span their gaps and are
+    left alone. `words` is one speaker channel in time order; returns a new
+    list, input untouched."""
+    out = [dict(w) for w in words]
+    n = len(out)
+    for i, w in enumerate(out):
+        if w.get("approx_timestamps"):
+            continue
+        nxt = out[i + 1]["start"] if i + 1 < n else (total_dur if total_dur is not None else w["end"] + tail)
+        gap = nxt - w["end"]
+        if gap <= 0:
+            continue
+        w["end"] = round(nxt if gap <= gap_fill else min(w["end"] + tail, nxt), 3)
+    return out
+
+
 IWV_MODEL_ID = "ai4bharat/indicwav2vec-hindi"
 IWV_WINDOW_SEC = 300     # model forward pass runs on windows of this length...
 IWV_CONTEXT_SEC = 10     # ...with this much extra audio each side, then discarded
@@ -1822,7 +1853,8 @@ def _iwv_alignment_loop(device_str, req_q, res_q):
             k += len(ids)
             aligned_by_idx[kept_idx[i]] = (round(int(ratio * sp[0].start) / sr, 3),
                                            round(int(ratio * sp[-1].end) / sr, 3))
-        return _interpolate_unaligned(all_words, aligned_by_idx, n_samples / sr)
+        return _extend_word_ends(_interpolate_unaligned(all_words, aligned_by_idx, n_samples / sr),
+                                 total_dur=n_samples / sr)
 
     while True:
         wav_path, text = req_q.get()
@@ -2112,6 +2144,11 @@ def transcribe_one(vid_dir: Path, device_str: str, overwrite: bool = False):
         "language_code": lang_code,
         "models": models,
         "aligner": os.environ.get("ALIGN_BACKEND", "iwv"),
+        # word ends extended toward the next word (see _extend_word_ends); only
+        # the IndicWav2Vec path does this, and Whisper-fallback words already
+        # carry their own end times
+        "end_fix": "v1" if (os.environ.get("ALIGN_BACKEND", "iwv") == "iwv"
+                            and not any("whisper" in m for m in models.values())) else None,
         "asr_stats": asr_stats,
         "suspect_language": suspect_language,
         "words": all_words,
