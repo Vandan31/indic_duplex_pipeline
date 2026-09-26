@@ -2121,15 +2121,47 @@ def transcribe_one(vid_dir: Path, device_str: str, overwrite: bool = False):
     return "ok"
 
 
+def _transcribe_multiprocess(args, devices):
+    """One worker PROCESS per GPU. The ASR decodes token by token in Python,
+    so worker threads in a single process serialize on the GIL: N GPUs then
+    give roughly one GPU's throughput (measured ~10 audio-hours per hour on 8
+    GPUs, node CPU load ~4). Separate processes scale close to linearly.
+    Each child is pinned to one GPU and handles the videos whose id hashes to
+    its shard, so results are identical to a single-process run."""
+    vis = [g.strip() for g in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if g.strip()]
+    procs = []
+    for i, dev in enumerate(devices):
+        idx = dev.split(":")[-1]
+        phys = vis[int(idx)] if vis else idx
+        cmd = [sys.executable, os.path.abspath(__file__), "transcribe",
+               "--root", str(args.root), "--gpus", "0", "--shard", f"{i}/{len(devices)}"]
+        if args.overwrite:
+            cmd.append("--overwrite")
+        procs.append(subprocess.Popen(cmd, env=dict(os.environ, CUDA_VISIBLE_DEVICES=phys)))
+    log(f"launched {len(procs)} worker processes, one per GPU: {devices}")
+    codes = [p.wait() for p in procs]
+    if any(codes):
+        sys.exit(f"worker exit codes: {codes}")
+    log("all workers finished")
+
+
 def cmd_transcribe(args):
     """Word-level-timestamped transcription over already-accepted videos —
     a separate pass over corpus/accepted/, independent of `run`."""
+    import zlib
     root = Path(args.root)
     accepted = sorted(d for d in (root / "accepted").iterdir() if d.is_dir())
     if not accepted:
         sys.exit(f"no accepted entries under {root/'accepted'}")
 
     devices = resolve_devices(args.gpus)
+    if getattr(args, "shard", None):
+        k, n = (int(x) for x in args.shard.split("/"))
+        # stable hash of the id, not list position: the directory can grow
+        # while a long run is in progress
+        accepted = [d for d in accepted if zlib.crc32(d.name.encode("utf-8")) % n == k]
+    elif len(devices) > 1 and devices != ["cpu"]:
+        return _transcribe_multiprocess(args, devices)
     log(f"transcribing {len(accepted)} video(s) on {devices}")
 
     work_q = queue.Queue()
@@ -2239,6 +2271,7 @@ def main():
                    help="'auto' (idle GPUs only), comma list e.g. '0,1', or 'cpu'")
     t.add_argument("--overwrite", action="store_true",
                    help="redo videos that already have transcript.json")
+    t.add_argument("--shard", default=None, help=argparse.SUPPRESS)  # "k/n", set by the launcher
     t.set_defaults(func=cmd_transcribe)
 
     args = ap.parse_args()

@@ -149,8 +149,10 @@ python duplex_corpus.py transcribe --root /path/to/your/corpus --gpus 0,1,2,3
 That's it. It's resumable (safe to Ctrl-C and rerun — skips clips that
 already have `transcript.json`, pass `--overwrite` to redo) and scales
 linearly with however many GPUs you list in `--gpus`, so for 4,000h you'll
-want as many as you can get. One worker thread per GPU; each accepted video
-is transcribed independently.
+want as many as you can get. With more than one GPU listed, `transcribe`
+launches one worker *process* per GPU (each pinned to its GPU and handling the
+videos whose id hashes to its shard); each accepted video is transcribed
+independently.
 
 **Expected input layout**, per `accepted/<id>/`:
 
@@ -215,8 +217,14 @@ than a few minutes. Validated against the old all-Whisper pipeline on a
 for Whisper, and no stuck/duplicate word timestamps vs ~78% of Whisper clips
 affected.
 
-Rough throughput to plan around: with the previous aligner about 10 hours of
-audio per wall-clock hour on 8 GPUs; expect roughly double with this one.
+Rough throughput to plan around: about **190 hours of audio per wall-clock
+hour on 8 GPUs** (measured on a production run, 60 clips, no failures; short
+clips run somewhat slower per audio-hour than long ones), so roughly a day and
+a half for 6,500 hours. Earlier versions ran the GPU workers as *threads* of a
+single process and topped out around 10 audio-hours per hour no matter how many
+GPUs were listed: the ASR decodes token by token in Python, so the threads
+serialized on the interpreter lock (node CPU load ~4, GPUs mostly idle).
+Worker processes remove that limit.
 
 Output, written to `accepted/<id>/transcript.json`:
 
@@ -290,6 +298,11 @@ Japanese from podcast RSS feeds, at far larger scale.
 
 ## Changelog
 
+- **2026-09-26 (latest) — One worker process per GPU.** `transcribe --gpus
+  0,1,2,3` previously ran its GPU workers as threads in one process, which the
+  interpreter lock capped at ~10 audio-hours/hour regardless of GPU count. It now
+  spawns one pinned worker process per GPU (~190 audio-hours/hour on 8 GPUs
+  measured, ~19x faster). Results are identical; a single GPU behaves as before.
 - **2026-09-26 (later) — Alignment switched to IndicWav2Vec, global instead of
   chunked.** The proportional chunking below turned out to misplace words on
   long clips (speech is not evenly spread over a clip, so words were forced
